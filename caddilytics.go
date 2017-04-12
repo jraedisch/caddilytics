@@ -1,3 +1,4 @@
+// Package caddilytics implements a minimal tracking middleware for Caddy via Google Analytics  Measurement Protocol.
 package caddilytics
 
 import (
@@ -50,7 +51,7 @@ func setup(c *caddy.Controller) error {
 	return nil
 }
 
-// Handler contains all functionality needed for measurement API calls.
+// Handler contains all functionality needed for Measurement Protocol API calls.
 type Handler struct {
 	sessionCookieName string
 	client            poster
@@ -97,6 +98,8 @@ func (ha Handler) ensureCookie(w http.ResponseWriter, r *http.Request) string {
 	return clientID
 }
 
+// ServeHTTP extends handler so that it may be used in a Caddy middleware.
+// It ensures a session cookie before and sends tracking data asynchronously after calling next middleware.
 func (ha Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) (code int, err error) {
 	clientID := ha.ensureCookie(w, r)
 	code, err = ha.next.ServeHTTP(w, r)
