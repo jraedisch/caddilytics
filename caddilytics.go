@@ -1,4 +1,4 @@
-// Package caddilytics implements a minimal tracking middleware for Caddy via Google Analytics  Measurement Protocol.
+// Package caddilytics implements a minimal Caddy middleware for tracking HTTP requests via Google Analytics Measurement Protocol.
 package caddilytics
 
 import (

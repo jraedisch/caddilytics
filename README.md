@@ -2,7 +2,7 @@
 
 [![GoDoc](https://godoc.org/github.com/jraedisch/caddilytics?status.svg)](https://godoc.org/github.com/jraedisch/caddilytics)
 
-This is a minimal logging middleware for tracking [Caddy][ca] requests via Google Analytics [Measurement Protocol][mp].  
+This repository contains a minimal [Caddy][ca] middleware for tracking HTTP requests via Google Analytics [Measurement Protocol][mp].  
 
 Any advice/criticism/PRs are welcome!
 
