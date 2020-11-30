@@ -1,7 +1,8 @@
-// Package caddilytics implements a minimal Caddy middleware for tracking HTTP requests via Google Analytics Measurement Protocol.
+// Package caddilytics implements a minimal Caddy module for tracking HTTP requests via Google Analytics Measurement Protocol.
 package caddilytics
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -9,9 +10,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mholt/caddy"
-	"github.com/mholt/caddy/caddyhttp/httpserver"
-	uuid "github.com/satori/go.uuid"
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/google/uuid"
+	"go.uber.org/zap"
 )
 
 var (
@@ -22,87 +26,86 @@ var (
 )
 
 func init() {
-	caddy.RegisterPlugin("caddilytics", caddy.Plugin{
-		ServerType: "http",
-		Action:     setup,
-	})
-}
-
-func setup(c *caddy.Controller) error {
-	args := [3]string{}
-	for i := 0; i < 3; i++ {
-		if !c.Next() {
-			return c.Err("Not Enough Arguments For Caddilytics")
-		}
-		args[i] = c.Val()
-	}
-	if !reTrackingID.MatchString(args[1]) {
-		return c.Errf("Not A Valid Tracking ID (UA-XXXX-Y): %s", args[1])
-	}
-	if reSessionCookieName.MatchString(args[2]) {
-		return c.Errf("Not A Valid Session Cookie Name: %s", args[2])
-	}
-
-	cfg := httpserver.GetConfig(c)
-	mid := func(next httpserver.Handler) httpserver.Handler {
-		return NewHandler(args[1], args[2], next)
-	}
-	cfg.AddMiddleware(mid)
-	return nil
-}
-
-// Handler contains all functionality needed for Measurement Protocol API calls.
-type Handler struct {
-	sessionCookieName string
-	client            poster
-	next              httpserver.Handler
-	// prefix caches the parts of the POST body that do not change with every request.
-	prefix string
+	caddy.RegisterModule(Middleware{})
+	httpcaddyfile.RegisterHandlerDirective("caddilytics", parseCaddyfile)
 }
 
 type poster interface {
 	Post(string, string, io.Reader) (*http.Response, error)
 }
 
-// NewHandler initializes a handler with a new http client (timeout 1 second).
-func NewHandler(trackingID, sessionCookieName string, next httpserver.Handler) Handler {
-	cl := &http.Client{Timeout: 1 * time.Second}
+// Middleware implements an HTTP handler that ensures a session cookie and sends analytics data to Google.
+type Middleware struct {
+	TrackingID        string
+	SessionCookieName string
+	client            poster
+	logger            *zap.Logger
+	// prefix caches the parts of the POST body that do not change with every request.
+	prefix string
+}
+
+// Provision implements caddy.Provisioner.
+func (m *Middleware) Provision(ctx caddy.Context) error {
+	m.logger = ctx.Logger(m)
+	m.client = &http.Client{Timeout: 1 * time.Second}
 	prefix := url.Values{}
 	prefix.Set("v", "1")
 	prefix.Set("t", "pageview")
-	prefix.Set("tid", trackingID)
-	return Handler{sessionCookieName, cl, next, prefix.Encode()}
+	prefix.Set("tid", m.TrackingID)
+	m.prefix = prefix.Encode()
+	return nil
 }
 
-func (ha Handler) setCookie(w http.ResponseWriter) string {
-	clientID := uuid.NewV4().String()
-	http.SetCookie(w, &http.Cookie{
-		Expires:  time.Unix(2147483647, 0),
-		Name:     ha.sessionCookieName,
-		Value:    clientID,
-		Secure:   true,
-		HttpOnly: true,
-	})
-	return clientID
-}
-
-func (ha Handler) ensureCookie(w http.ResponseWriter, r *http.Request) string {
-	cookie, err := r.Cookie(ha.sessionCookieName)
-	if err != nil {
-		return ha.setCookie(w)
+// Validate implements caddy.Validator.
+func (m *Middleware) Validate() error {
+	if !reTrackingID.MatchString(m.TrackingID) {
+		return fmt.Errorf("not a valid tracking ID (UA-XXXX-Y): %s", m.TrackingID)
 	}
-	clientID := cookie.Value
-	if clientID == "" {
-		return ha.setCookie(w)
+	if reSessionCookieName.MatchString(m.SessionCookieName) {
+		return fmt.Errorf("not a valid session cookie name: %s", m.SessionCookieName)
 	}
-	return clientID
+	return nil
 }
 
-// ServeHTTP extends handler so that it may be used in a Caddy middleware.
-// It ensures a session cookie before and sends tracking data asynchronously after calling next middleware.
-func (ha Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) (code int, err error) {
-	clientID := ha.ensureCookie(w, r)
-	code, err = ha.next.ServeHTTP(w, r)
+// CaddyModule returns the Caddy module information.
+func (Middleware) CaddyModule() caddy.ModuleInfo {
+	return caddy.ModuleInfo{
+		ID:  "http.handlers.caddilytics",
+		New: func() caddy.Module { return new(Middleware) },
+	}
+}
+
+// UnmarshalCaddyfile implements caddyfile.Unmarshaler.
+func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	for d.Next() {
+		if !d.Args(&m.TrackingID, &m.SessionCookieName) {
+			return d.ArgErr()
+		}
+	}
+	return nil
+}
+
+// parseCaddyfile unmarshals tokens from h into a new Middleware.
+func parseCaddyfile(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
+	var m Middleware
+	err := m.UnmarshalCaddyfile(h.Dispenser)
+	return m, err
+}
+
+// ServeHTTP ensures a session cookie before and sends tracking data asynchronously after calling next middleware.
+func (m Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	clientID, uuidErr := m.ensureCookie(w, r)
+	httpErr := next.ServeHTTP(w, r)
+	if uuidErr != nil {
+		m.logger.Error(fmt.Sprintf("uuid generation error: %v", uuidErr))
+		return nil
+	}
+
+	var code int
+	if handlerErr, ok := httpErr.(caddyhttp.HandlerError); ok {
+		code = handlerErr.StatusCode
+		httpErr = handlerErr.Err
+	}
 	trackingData := url.Values{}
 	trackingData.Set("cid", clientID)
 	trackingData.Set("dl", r.RequestURI)
@@ -116,12 +119,45 @@ func (ha Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) (code int, e
 		trackingData.Set("ul", lang)
 	}
 	if code > 499 {
-		trackingData.Set("exf", err.Error())
+		trackingData.Set("exf", httpErr.Error())
 	}
-	go ha.client.Post(
+	go m.client.Post(
 		"http://www.google-analytics.com/collect",
 		"application/x-www-form-urlencoded; charset=UTF-8",
-		strings.NewReader(ha.prefix+"&"+trackingData.Encode()),
+		strings.NewReader(m.prefix+"&"+trackingData.Encode()),
 	)
-	return
+	return nil
 }
+
+func (m *Middleware) setCookie(w http.ResponseWriter) (string, error) {
+	randomID, err := uuid.NewRandom()
+	clientID := randomID.String()
+	http.SetCookie(w, &http.Cookie{
+		Expires:  time.Unix(2147483647, 0),
+		Name:     m.SessionCookieName,
+		Value:    clientID,
+		Secure:   true,
+		HttpOnly: true,
+	})
+	return clientID, err
+}
+
+func (m *Middleware) ensureCookie(w http.ResponseWriter, r *http.Request) (string, error) {
+	cookie, err := r.Cookie(m.SessionCookieName)
+	if err != nil {
+		return m.setCookie(w)
+	}
+	clientID := cookie.Value
+	if clientID == "" {
+		return m.setCookie(w)
+	}
+	return clientID, nil
+}
+
+// Interface guards
+var (
+	_ caddy.Provisioner           = (*Middleware)(nil)
+	_ caddy.Validator             = (*Middleware)(nil)
+	_ caddyhttp.MiddlewareHandler = (*Middleware)(nil)
+	_ caddyfile.Unmarshaler       = (*Middleware)(nil)
+)

@@ -7,52 +7,53 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"reflect"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/mholt/caddy"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
 var reUUID = regexp.MustCompile("^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 
-var setupTests = []struct {
-	config string
-	err    error
-}{
-	{
-		"caddilytics UA-1234-5 test-session",
-		nil,
-	},
-	{
-		"UA-1234-5 test-session",
-		errors.New("Testfile:1 - Parse error: Not Enough Arguments For Caddilytics"),
-	},
-	{
-		"caddilytics UA-123-5 test-session",
-		errors.New("Testfile:1 - Parse error: Not A Valid Tracking ID (UA-XXXX-Y): UA-123-5"),
-	},
-	{
-		"caddilytics UA-1234-5 bro=ken",
-		errors.New("Testfile:1 - Parse error: Not A Valid Session Cookie Name: bro=ken"),
-	},
+func TestValidation(t *testing.T) {
+	m := &Middleware{TrackingID: "UA-1234-5", SessionCookieName: "my_session"}
+	err := m.Validate()
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
 }
 
-func TestSetup(t *testing.T) {
-	for _, tt := range setupTests {
-		c := caddy.NewTestController("http", tt.config)
-		if err := setup(c); !reflect.DeepEqual(tt.err, err) {
-			t.Errorf("Expected error '%v', got '%v'", tt.err, err.Error())
-		}
+func TestUnmarshalling(t *testing.T) {
+	m := &Middleware{}
+	err := m.UnmarshalCaddyfile(caddyfile.NewTestDispenser("caddilytics UA-1234-5 my_session"))
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if m.TrackingID != "UA-1234-5" {
+		t.Errorf("unexpected TrackingID: %s", m.TrackingID)
+	}
+	if m.SessionCookieName != "my_session" {
+		t.Errorf("unexpected SessionCookieName: %s", m.SessionCookieName)
 	}
 }
 
 func TestServeHTTP(t *testing.T) {
+	prefix := url.Values{}
+	prefix.Set("v", "1")
+	prefix.Set("t", "pageview")
+	prefix.Set("tid", "UA-1234-5")
+	prefixEncoded := prefix.Encode()
+
 	th := &testHelper{}
-	ha := NewHandler("UA-1234-5", "test-session", th)
-	ha.client = th
+	m := &Middleware{
+		TrackingID:        "UA-1234-5",
+		SessionCookieName: "test-session",
+		client:            th,
+		prefix:            prefixEncoded,
+	}
 	r := httptest.NewRequest(
 		"POST",
 		"http://example.com/example?a=b",
@@ -61,9 +62,10 @@ func TestServeHTTP(t *testing.T) {
 	r.Header.Add("Accept-Language", "it")
 	r.Header.Add("User-Agent", "firefox")
 	r.Header.Add("Referer", "http://example.com/source")
-	ha.ServeHTTP(
+	m.ServeHTTP(
 		httptest.NewRecorder(),
 		r,
+		th,
 	)
 
 	time.Sleep(1 * time.Millisecond)
@@ -92,18 +94,23 @@ func TestServeHTTP(t *testing.T) {
 		t.Errorf("Unexpected referer: %s", th.postData.Get("dr"))
 	}
 
-	th2 := &testHelper{code: 500, err: errors.New("Internal Server Error")}
-	ha2 := NewHandler("UA-1234-5", "test-session", th2)
-	ha2.client = th2
+	th2 := &testHelper{err: caddyhttp.Error(500, errors.New("Internal Server Error"))}
+	m2 := &Middleware{
+		TrackingID:        "UA-1234-5",
+		SessionCookieName: "test-session",
+		client:            th2,
+		prefix:            prefixEncoded,
+	}
 	r2 := httptest.NewRequest(
 		"POST",
 		"http://example.com/example?a=b",
 		strings.NewReader(""),
 	)
 	r2.AddCookie(&http.Cookie{Name: "test-session", Value: "bfe7ee5b-f58e-44dc-a30a-7d4e52392079"})
-	ha2.ServeHTTP(
+	m2.ServeHTTP(
 		httptest.NewRecorder(),
 		r2,
+		th2,
 	)
 
 	time.Sleep(1 * time.Millisecond)
@@ -118,13 +125,12 @@ func TestServeHTTP(t *testing.T) {
 type testHelper struct {
 	postCall, nextCall int
 	postData           url.Values
-	code               int
 	err                error
 }
 
-func (th *testHelper) ServeHTTP(http.ResponseWriter, *http.Request) (int, error) {
+func (th *testHelper) ServeHTTP(http.ResponseWriter, *http.Request) error {
 	th.nextCall++
-	return th.code, th.err
+	return th.err
 }
 
 func (th *testHelper) Post(target string, contentType string, body io.Reader) (*http.Response, error) {
