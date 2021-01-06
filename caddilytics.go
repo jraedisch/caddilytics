@@ -135,6 +135,7 @@ func (m *Middleware) setCookie(w http.ResponseWriter) (string, error) {
 	http.SetCookie(w, &http.Cookie{
 		Expires:  time.Unix(2147483647, 0),
 		Name:     m.SessionCookieName,
+		Path:     "/",
 		Value:    clientID,
 		Secure:   true,
 		HttpOnly: true,
